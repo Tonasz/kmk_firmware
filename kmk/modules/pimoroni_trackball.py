@@ -45,6 +45,7 @@ MSK_CTRL_RESET = 0b00000010
 MSK_CTRL_FREAD = 0b00000100
 MSK_CTRL_FWRITE = 0b00001000
 
+HID_LIMIT = 127
 ANGLE_OFFSET = 0
 
 
@@ -58,15 +59,25 @@ class TrackballMode:
 class Trackball(Module):
     '''Module handles usage of Trackball Breakout by Pimoroni'''
 
-    def __init__(self, i2c, mode=TrackballMode.MOUSE_MODE, address=I2C_ADDRESS):
+    def __init__(
+        self,
+        i2c,
+        mode=TrackballMode.MOUSE_MODE,
+        address=I2C_ADDRESS,
+        click_enabled=True,
+    ):
         self._i2c_address = address
         self._i2c_bus = i2c
+        self._click_enabled = click_enabled
 
         self.pointing_device = PointingDevice()
         self.mode = mode
         self.previous_state = False  # click state
         self.polling_interval = 20
         self.last_tick = ticks_ms()
+
+        self._unsent_move_x = 0
+        self._unsent_move_y = 0
 
         chip_id = struct.unpack('<H', bytearray(self._i2c_rdwr([REG_CHIP_ID_L], 2)))[0]
         if chip_id != CHIP_ID:
@@ -89,6 +100,8 @@ class Trackball(Module):
         '''
         now = ticks_ms()
         if now - self.last_tick < self.polling_interval:
+            if self._unsent_move_x != 0 or self._unsent_move_y != 0:
+                self._apply_movement_to_hid(0, 0)
             return
         self.last_tick = now
 
@@ -96,14 +109,7 @@ class Trackball(Module):
 
         if self.mode == TrackballMode.MOUSE_MODE:
             x_axis, y_axis = self._calculate_movement(right - left, down - up)
-            if x_axis >= 0:
-                self.pointing_device.report_x[0] = x_axis
-            else:
-                self.pointing_device.report_x[0] = 0xFF & x_axis
-            if y_axis >= 0:
-                self.pointing_device.report_y[0] = y_axis
-            else:
-                self.pointing_device.report_y[0] = 0xFF & y_axis
+            self._apply_movement_to_hid(x_axis, y_axis)
             self.pointing_device.hid_pending = x_axis != 0 or y_axis != 0
         else:  # SCROLL_MODE
             if up >= 0:
@@ -112,7 +118,7 @@ class Trackball(Module):
                 self.pointing_device.report_w[0] = 0xFF & (0 - down)
             self.pointing_device.hid_pending = up != 0 or down != 0
 
-        if switch == 1:  # Button pressed
+        if self._click_enabled and switch == 1:  # Button pressed
             self.pointing_device.button_status[0] |= self.pointing_device.MB_LMB
             self.pointing_device.hid_pending = True
 
@@ -182,8 +188,8 @@ class Trackball(Module):
         if raw_x == 0 and raw_y == 0:
             return 0, 0
 
-        var_accel = 1
-        power = 2.5
+        var_accel = 0.75
+        power = 2.6
 
         angle_rad = math.atan2(raw_y, raw_x) + ANGLE_OFFSET
         vector_length = math.sqrt(pow(raw_x, 2) + pow(raw_y, 2))
@@ -191,11 +197,38 @@ class Trackball(Module):
         x = math.floor(vector_length * math.cos(angle_rad))
         y = math.floor(vector_length * math.sin(angle_rad))
 
-        limit = 127  # hid size limit
-        x_clamped = max(min(limit, x), -limit)
-        y_clamped = max(min(limit, y), -limit)
+        sanity_limit = 2048
+        x = max(min(sanity_limit, x), -sanity_limit)
+        y = max(min(sanity_limit, y), -sanity_limit)
+
+        x_clamped = max(min(HID_LIMIT, x), -HID_LIMIT)
+        y_clamped = max(min(HID_LIMIT, y), -HID_LIMIT)
+        self._unsent_move_x += x - x_clamped
+        self._unsent_move_y += y - y_clamped
 
         return x_clamped, y_clamped
+
+    def _apply_movement_to_hid(self, x_axis, y_axis):
+        if self._unsent_move_x != 0:
+            max_add = HID_LIMIT - abs(x_axis)
+            add = max(min(max_add, self._unsent_move_x), -max_add)
+            x_axis += add
+            self._unsent_move_x -= add
+        if self._unsent_move_y != 0:
+            max_add = HID_LIMIT - abs(y_axis)
+            add = max(min(max_add, self._unsent_move_y), -max_add)
+            y_axis += add
+            self._unsent_move_y -= add
+
+        if x_axis >= 0:
+            self.pointing_device.report_x[0] = x_axis
+        else:
+            self.pointing_device.report_x[0] = 0xFF & x_axis
+        if y_axis >= 0:
+            self.pointing_device.report_y[0] = y_axis
+        else:
+            self.pointing_device.report_y[0] = 0xFF & y_axis
+        self.pointing_device.hid_pending = x_axis != 0 or y_axis != 0
 
     def _i2c_rdwr(self, data, length=0):
         '''Write and optionally read I2C data.'''
