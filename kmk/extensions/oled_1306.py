@@ -1,4 +1,5 @@
 import adafruit_ssd1306
+from supervisor import ticks_ms
 
 from kmk.extensions import Extension
 from kmk.handlers.stock import passthrough as handler_passthrough
@@ -9,7 +10,7 @@ class DisplayOLED(Extension):
     I2C_ADDRESS = 0x3C
 
     def __init__(
-        self, i2c, scenes, *, width=128, height=64, flip=False, address=I2C_ADDRESS
+            self, i2c, scenes, *, width=128, height=64, flip=False, address=I2C_ADDRESS
     ):
         self._i2c_address = address
         self._i2c_bus = i2c
@@ -20,6 +21,8 @@ class DisplayOLED(Extension):
         self._current_scene = 0
         self._redraw_forced = False
         self._asleep = False
+        self.polling_interval = 100
+        self._last_tick = ticks_ms()
 
         if flip:
             self._display.rotate(180)
@@ -60,13 +63,16 @@ class DisplayOLED(Extension):
             return
 
         scene = self._get_active_scene()
-        if self._redraw_forced or scene.is_redraw_needed(sandbox):
+        now = ticks_ms()
+        ready = (now - self._last_tick >= scene.polling_interval) and scene.is_redraw_needed(sandbox)
+        if self._redraw_forced or ready:
             if self._redraw_forced:
                 scene.forced_draw(self, self._display, sandbox)
             else:
                 scene.draw(self, self._display, sandbox)
             self._display.show()
             self._redraw_forced = False
+            self._last_tick = now
         return
 
     def on_runtime_enable(self, keyboard):
@@ -108,6 +114,8 @@ class DisplayOLED(Extension):
 
 
 class DisplayScene:
+    polling_interval = 40
+
     def is_redraw_needed(self, sandbox):
         raise NotImplementedError
 
@@ -133,11 +141,12 @@ class LogoScene(DisplayScene):
 
 
 class KeypressesScene(DisplayScene):
-    def __init__(self, matrix_width, matrix_height, split=False):
+    def __init__(self, matrix_width, matrix_height, split=False, keymap=None):
         # todo:these parameters could be autodetected
         self._matrix_width = matrix_width
         self._matrix_height = matrix_height
         self._split = split
+        self._keymap = keymap
         self._x = 0
         self._y = 0
         self._size = 6
@@ -173,8 +182,11 @@ class KeypressesScene(DisplayScene):
         if not sandbox.matrix_update and not sandbox.secondary_matrix_update:
             return
         change = sandbox.matrix_update or sandbox.secondary_matrix_update
+        (x, y) = self._get_pos(change.key_number)
+        if x is None or y is None:
+            return
         # todo: unfortunately there is a bug with right side - it miss keypresses
-        self._draw_key(display, change[1], change[0], change[2])
+        self._draw_key(display, x, y, change.pressed)
         return
 
     def _draw_key(self, display, col, row, status):
@@ -185,16 +197,70 @@ class KeypressesScene(DisplayScene):
         display.rect(x, y, self._size, self._size, status, fill=True)
         return
 
+    def _get_pos(self, key):
+        width = self._matrix_width if not self._split else self._matrix_width / 2
+        y = key // width
+        x = key - (y * width)
+        if self._split and y >= self._matrix_height:
+            y -= self._matrix_height
+            x = 2 * width - x - 1
+        return (x, y)
+
+
+from kmk.extensions.rgb import AnimationModes
+
 
 class StatusScene(DisplayScene):
     last_layer = 0
+    last_rgb_mode = 0
+
+    def __init__(self, *, layers_names=None, separate_default_layer=False, rgb_ext=None):
+        self.layers_names = layers_names
+        self.separate_default_layer = separate_default_layer
+        self.rgb_ext = rgb_ext
 
     def is_redraw_needed(self, sandbox):
         if self.last_layer != sandbox.active_layers[0]:
             self.last_layer = sandbox.active_layers[0]
             return True
+        if self.rgb_ext and self.last_rgb_mode != self.rgb_ext.animation_mode:
+            self.last_rgb_mode = self.rgb_ext.animation_mode
+            return True
         return False
 
     def draw(self, oled, display, sandbox):
         display.fill(0)
-        display.text(f"Layer {sandbox.active_layers[0]}", 5, 25, 1)
+        # add layer text
+        if len(sandbox.active_layers) > 1:
+            layout_def = sandbox.active_layers[1]
+            if self.separate_default_layer:
+                display.text(self._get_layer_name(self.last_layer), 5, 20, 1)
+                display.text(self._get_layer_name(layout_def), 5, 30, 1)
+            else:
+                display.text(self._get_layer_name(self.last_layer), 5, 30, 1)
+        else:
+            display.text(self._get_layer_name(self.last_layer), 5, 30, 1)
+        # add RGB mode text
+        if self.rgb_ext is not None:
+            display.text(f'RGB: {self._get_rgb_mode_name(self.last_rgb_mode)}', 5, 40, 1)
+
+    def _get_layer_name(self, layer_no):
+        return self.layers_names[layer_no] if self.layers_names is not None else f"Layer {layer_no}"
+
+    def _get_rgb_mode_name(self, rgb_mode):
+        if rgb_mode == AnimationModes.STATIC or rgb_mode == AnimationModes.STATIC_STANDBY:
+            return 'Static'
+        elif rgb_mode == AnimationModes.BREATHING:
+            return 'Breathing'
+        elif rgb_mode == AnimationModes.RAINBOW:
+            return 'Rainbow'
+        elif rgb_mode == AnimationModes.BREATHING_RAINBOW:
+            return 'Breathing rainbow'
+        elif rgb_mode == AnimationModes.KNIGHT:
+            return 'Knight'
+        elif rgb_mode == AnimationModes.SWIRL:
+            return 'Swirl'
+        elif rgb_mode == AnimationModes.USER:
+            return 'User'
+        else:
+            return 'other'
