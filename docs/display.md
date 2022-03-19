@@ -5,7 +5,7 @@ on [DisplayIO driver version](https://github.com/adafruit/Adafruit_CircuitPython
 
 ### Currently compatible screens
 
-Only SSD1306 OLED screen (tested on 128x64 one)
+Only SSD1306 OLED screen (tested on horizontal 128x64 and 128x32)
 
 ### Required libraries
 
